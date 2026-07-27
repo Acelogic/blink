@@ -129,7 +129,16 @@ const u8 kJitSav[5] = {kJitSav0, kJitSav1, kJitSav2, kJitSav3, kJitSav4};
 #define MOVE_SRC(a)    ((0x00ff00 & (a)) >> 8)
 #define HASH(virt)     (virt)
 
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+static u8 *g_code;
+#define kJitVeneerReserve 65536
+#define kJitVeneerSize    32
+#define kJitVeneerCount   (kJitVeneerReserve / kJitVeneerSize)
+static uintptr_t g_jit_veneer_targets[kJitVeneerCount];
+static size_t g_jit_veneer_count;
+#else
 static u8 g_code[kJitMemorySize];
+#endif
 
 static struct JitGlobals {
   pthread_mutex_t_ lock;
@@ -138,8 +147,54 @@ static struct JitGlobals {
   struct Dll *freeblocks;
 } g_jit = {
     PTHREAD_MUTEX_INITIALIZER_,
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    PROT_READ | PROT_WRITE,
+#else
     PROT_READ | PROT_WRITE | PROT_EXEC,
+#endif
 };
+
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+struct JitCopyContext {
+  void *dst;
+  const void *src;
+  size_t size;
+};
+
+struct JitPatchContext {
+  _Atomic(u32) *dst;
+  u32 value;
+};
+
+__attribute__((naked, noinline, optnone))
+static void *Jit26CopyRegion(void *dst, const void *src, size_t size) {
+  asm volatile("mov x16, #3\n"
+               "brk #0xf00d\n"
+               "ret");
+}
+
+static int CopyToJitMemory(void *opaque) {
+  struct JitCopyContext *ctx = (struct JitCopyContext *)opaque;
+  return Jit26CopyRegion(ctx->dst, ctx->src, ctx->size) == ctx->dst ? 0 : -1;
+}
+
+static int PatchJitMemory(void *opaque) {
+  struct JitPatchContext *ctx = (struct JitPatchContext *)opaque;
+  return Jit26CopyRegion((void *)ctx->dst, &ctx->value,
+                         sizeof(ctx->value)) == (void *)ctx->dst
+             ? 0
+             : -1;
+}
+
+PTHREAD_JIT_WRITE_ALLOW_CALLBACKS_NP(CopyToJitMemory, PatchJitMemory);
+
+__attribute__((naked, noinline, optnone))
+static void *Jit26PrepareRegion(void *addr, size_t size) {
+  asm volatile("mov x16, #1\n"
+               "brk #0xf00d\n"
+               "ret");
+}
+#endif
 
 static inline u64 RoundupTwoPow(u64 x) {
   return x > 1 ? (u64)2 << bsr(x - 1) : x ? 1 : 0;
@@ -175,10 +230,8 @@ static inline unsigned ShallNotPass(unsigned gen1, _Atomic(unsigned) *genptr) {
 // frequently flakes with "Trace/BPT trap: 5" errors. this fixes that.
 static void pthread_jit_write_protect_np_workaround(int enabled) {
 #if defined(__APPLE__) && TARGET_OS_IPHONE
-  // iOS exposes pthread_jit_write_protect_supported_np(), but explicitly
-  // marks pthread_jit_write_protect_np() unavailable. A debugger-enabled iOS
-  // process receives an RWX MAP_JIT mapping, so there is no per-thread
-  // write-protection state to toggle.
+  // The public per-thread toggle is unavailable on iOS. Once StikDebug has
+  // attached, MAP_JIT pages are debugger-authorized for simultaneous use.
   (void)enabled;
 #elif defined(__APPLE__) && defined(__aarch64__)
   int count_start = 8192;
@@ -341,6 +394,7 @@ static void FreeJitBlock(struct JitBlock *jb) {
     dll_remove(&jb->freejumps, e);
     FreeJitJump(JITJUMP_CONTAINER(e));
   }
+  Free(jb->staging);
   Free(jb);
 }
 
@@ -641,6 +695,91 @@ static u8 *AllocateJitMemory(long *state) {
   return g_code + i;
 }
 
+static bool EnsureJitMemoryPool(void) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+  void *memory;
+  LOCK(&g_jit.lock);
+  if (!g_code) {
+    if (__builtin_available(iOS 26.0, *)) {
+      // On TXM devices the executable region itself must be allocated by
+      // debugserver. Passing a null address asks StikDebug's universal script
+      // to use _M<size>,rx, prepare every page, and return the new address.
+      memory = Jit26PrepareRegion(0, kJitMemorySize);
+      if (!memory) {
+        LOGF("StikDebug failed to allocate the iOS jit pool");
+        memory = MAP_FAILED;
+        errno = EPERM;
+      }
+    } else {
+      // Pre-TXM iOS accepts a normal mapping after CS_DEBUGGED is set.
+      memory = Mmap(0, kJitMemorySize, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS_, -1, 0, "jit");
+      if (memory == MAP_FAILED) {
+        LOGF("failed to mmap() iOS jit pool: %s", DescribeHostErrno(errno));
+      }
+    }
+    if (memory != MAP_FAILED) {
+      g_code = (u8 *)memory;
+      g_jit_veneer_count = 0;
+      memset(g_jit_veneer_targets, 0, sizeof(g_jit_veneer_targets));
+      JIT_LOGF("allocated iOS jit pool [%p,%p)", g_code,
+               g_code + kJitMemorySize);
+    }
+  }
+  UNLOCK(&g_jit.lock);
+  return g_code != 0;
+#else
+  return true;
+#endif
+}
+
+#if defined(__APPLE__) && TARGET_OS_IPHONE && defined(__aarch64__)
+static uintptr_t GetJitVeneer(uintptr_t target) {
+  u32 code[5];
+  uintptr_t veneer;
+  struct JitCopyContext ctx;
+  size_t i;
+
+  LOCK(&g_jit.lock);
+  for (i = 0; i < g_jit_veneer_count; ++i) {
+    if (g_jit_veneer_targets[i] == target) {
+      veneer = (uintptr_t)g_code + i * kJitVeneerSize;
+      UNLOCK(&g_jit.lock);
+      return veneer;
+    }
+  }
+  if (g_jit_veneer_count == kJitVeneerCount) {
+    UNLOCK(&g_jit.lock);
+    return 0;
+  }
+
+  i = g_jit_veneer_count++;
+  g_jit_veneer_targets[i] = target;
+  veneer = (uintptr_t)g_code + i * kJitVeneerSize;
+  code[0] = kArmMovZex |
+            ((target >> 0 & kArmImmMax) << kArmImmOff) | kArmIp0;
+  code[1] = kArmMovNex | 1 << kArmIdxOff |
+            ((target >> 16 & kArmImmMax) << kArmImmOff) | kArmIp0;
+  code[2] = kArmMovNex | 2 << kArmIdxOff |
+            ((target >> 32 & kArmImmMax) << kArmImmOff) | kArmIp0;
+  code[3] = kArmMovNex | 3 << kArmIdxOff |
+            ((target >> 48 & kArmImmMax) << kArmImmOff) | kArmIp0;
+  code[4] = kArmJumpReg | kArmIp0 << 5;
+  ctx.dst = (void *)veneer;
+  ctx.src = code;
+  ctx.size = sizeof(code);
+  if (CopyToJitMemory(&ctx) || memcmp(ctx.dst, ctx.src, ctx.size)) {
+    --g_jit_veneer_count;
+    g_jit_veneer_targets[i] = 0;
+    UNLOCK(&g_jit.lock);
+    return 0;
+  }
+  sys_icache_invalidate(ctx.dst, ctx.size);
+  UNLOCK(&g_jit.lock);
+  return veneer;
+}
+#endif
+
 static int MakeJitJump(u8 buf[5], uintptr_t pc, uintptr_t addr) {
   int n;
   intptr_t disp;
@@ -771,6 +910,9 @@ int InitJit(struct Jit *jit, uintptr_t opt_staging_function) {
   unassert(FLAG_pagesize >= 4096);
   unassert(kJitBlockSize >= FLAG_pagesize);
   unassert(!(kJitBlockSize % FLAG_pagesize));
+  if (!EnsureJitMemoryPool()) {
+    return -1;
+  }
   memset(jit, 0, sizeof(*jit));
   InitEdges(&jit->edges);
   InitEdges(&jit->redges);
@@ -781,7 +923,12 @@ int InitJit(struct Jit *jit, uintptr_t opt_staging_function) {
   unassert(funcs = (_Atomic(int) *)Calloc(n, sizeof(*funcs)));
   atomic_store_explicit(&jit->hooks.virts, virts, memory_order_relaxed);
   atomic_store_explicit(&jit->hooks.funcs, funcs, memory_order_relaxed);
-  for (brk = 0; (jb = InitJitBlock(jit, &brk));) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+  brk = kJitVeneerReserve;
+#else
+  brk = 0;
+#endif
+  for (; (jb = InitJitBlock(jit, &brk));) {
     dll_make_last(&g_jit.freeblocks, &jb->elem);
     ++g_jit.freecount;
   }
@@ -838,6 +985,14 @@ int ShutdownJit(void) {
     --g_jit.freecount;
   }
   unassert(!g_jit.freecount);
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+  if (g_code) {
+    unassert(!Munmap(g_code, kJitMemorySize));
+    g_code = 0;
+    g_jit_veneer_count = 0;
+    memset(g_jit_veneer_targets, 0, sizeof(g_jit_veneer_targets));
+  }
+#endif
   return 0;
 }
 
@@ -1281,7 +1436,14 @@ static bool CheckMmapResult(void *want, void *got) {
 }
 
 static bool PrepareJitMemory(void *addr, size_t size) {
-#ifdef MAP_JIT
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+  // The TXM pool is allocated RX by debugserver and must remain RX. Generated
+  // bytes live in each block's writable staging buffer until StikDebug copies
+  // them into this address through the debugger.
+  (void)addr;
+  (void)size;
+  return true;
+#elif defined(MAP_JIT)
   // Apple M1 only permits RWX memory if we use MAP_JIT, which Apple has
   // chosen to make incompatible with MAP_FIXED.
   if (Munmap(addr, size)) {
@@ -1358,6 +1520,11 @@ struct JitBlock *StartJit(struct Jit *jit, i64 opt_virt) {
     jb = 0;
   }
   if (jb) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    if (!jb->staging) {
+      unassert(jb->staging = (u8 *)Calloc(1, kJitBlockSize));
+    }
+#endif
     jb->virt = opt_virt;
     unassert(!(jb->start & (kJitAlign - 1)));
     unassert(jb->start == jb->index);
@@ -1373,6 +1540,15 @@ struct JitBlock *StartJit(struct Jit *jit, i64 opt_virt) {
     }
   }
   return jb;
+}
+
+static inline u8 *GetJitWriteAddress(struct JitBlock *jb) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+  unassert(jb->staging);
+  return jb->staging;
+#else
+  return jb->addr;
+#endif
 }
 
 static bool OomJit(struct JitBlock *jb) {
@@ -1391,7 +1567,7 @@ inline bool AppendJit(struct JitBlock *jb, const void *data, long size) {
   unassert(size > 0);
   jb->lastaction = 0;
   if (size <= GetJitRemaining(jb)) {
-    memcpy(jb->addr + jb->index, data, size);
+    memcpy(GetJitWriteAddress(jb) + jb->index, data, size);
     jb->index += size;
     return true;
   } else {
@@ -1437,7 +1613,15 @@ static void FixupJitJumps(struct JitBlock *jb, struct Dll *list,
     n = MakeJitJump(u.b, (uintptr_t)jj->code, addr + jj->addend);
     unassert(!((uintptr_t)jj->code & 3));
 #if defined(__aarch64__)
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    struct JitPatchContext ctx = {
+        (_Atomic(u32) *)jj->code,
+        u.i,
+    };
+    unassert(!PatchJitMemory(&ctx));
+#else
     atomic_store_explicit((_Atomic(u32) *)jj->code, u.i, memory_order_release);
+#endif
 #elif defined(__x86_64__)
     u64 old, neu;
     old = atomic_load_explicit((_Atomic(u64) *)jj->code, memory_order_relaxed);
@@ -1508,7 +1692,22 @@ int CommitJit_(struct Jit *jit, struct JitBlock *jb) {
       FreeJitJump(JITJUMP_CONTAINER(e));
     }
     // ask system to change the page memory protections
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    // Install complete pages with one debugger stop instead of stopping once
+    // per generated function. Hooks for this deferred-commit path do not go
+    // live until after the copy and W^X transition below.
+    struct JitCopyContext ctx = {
+        addr,
+        jb->staging + jb->committed,
+        size,
+    };
+    unassert(!CopyToJitMemory(&ctx));
+    unassert(!memcmp(ctx.dst, ctx.src, ctx.size));
     unassert(!Mprotect(addr, size, PROT_READ | PROT_EXEC, "jit"));
+    sys_icache_invalidate(addr, size);
+#else
+    unassert(!Mprotect(addr, size, PROT_READ | PROT_EXEC, "jit"));
+#endif
     // update interpreter hooks so our new jit code goes live
     while ((e = dll_first(jb->staged))) {
       js = JITSTAGE_CONTAINER(e);
@@ -1828,7 +2027,7 @@ bool AppendJitMovReg(struct JitBlock *jb, int dst, int src) {
 #if defined(__x86_64__)
   unassert(!(dst & ~15));
   unassert(!(src & ~15));
-  Write32(jb->addr + jb->index,
+  Write32(GetJitWriteAddress(jb) + jb->index,
           ((kAmdRexw | (src & 8 ? kAmdRexr : 0) | (dst & 8 ? kAmdRexb : 0)) |
            0x89 << 010 | (0300 | (src & 7) << 3 | (dst & 7)) << 020));
   jb->index += 3;
@@ -1841,7 +2040,8 @@ bool AppendJitMovReg(struct JitBlock *jb, int dst, int src) {
   // 0b10101010000100110000001111100000 mov x0, x19
   unassert(!(dst & ~31));
   unassert(!(src & ~31));
-  Put32(jb->addr + jb->index, 0xaa0003e0 | src << 16 | dst);
+  Put32(GetJitWriteAddress(jb) + jb->index,
+        0xaa0003e0 | src << 16 | dst);
   jb->index += 4;
 #endif
   jb->lastaction = action;
@@ -1905,8 +2105,29 @@ bool AppendJitCall(struct JitBlock *jb, void *func) {
   //
   disp = addr - GetJitPc(jb);
   disp >>= 2;
-  unassert(kArmDispMin <= disp && disp <= kArmDispMax);
-  buf[0] = kArmCall | (disp & kArmDispMask);
+  if (kArmDispMin <= disp && disp <= kArmDispMax) {
+    buf[0] = kArmCall | (disp & kArmDispMask);
+  } else {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    // Blink's AArch64 emitters assume calls are always one instruction. A
+    // multi-instruction absolute call changes local branch displacements and
+    // can make a conditional branch land in the middle of the sequence.
+    // Keep the call four bytes by branching to a target-specific veneer in
+    // the nearby reserved portion of the debugserver-allocated JIT pool.
+    if (!(addr = GetJitVeneer(addr))) return false;
+    disp = addr - GetJitPc(jb);
+    disp >>= 2;
+    unassert(kArmDispMin <= disp && disp <= kArmDispMax);
+    buf[0] = kArmCall | (disp & kArmDispMask);
+#else
+    // BL only has a +/-128 MiB range. On iOS the RX memory allocated by
+    // debugserver is not guaranteed to be that close to the app image.
+    // Materialize the absolute address in AAPCS64's IP0 scratch register
+    // and branch through it instead of silently wrapping the displacement.
+    if (!AppendJitSetReg(jb, kArmIp0, addr)) return false;
+    buf[0] = kArmCallReg | kArmIp0 << 5;
+#endif
+  }
   n = 4;
 #endif
   return AppendJit(jb, buf, n);
@@ -1920,9 +2141,37 @@ bool AppendJitCall(struct JitBlock *jb, void *func) {
  * @return true if room was available, otherwise false
  */
 bool AppendJitJump(struct JitBlock *jb, void *code) {
+#if defined(__aarch64__)
+  uint32_t instruction;
+  intptr_t disp;
+  uintptr_t addr = (uintptr_t)code;
+  disp = addr - GetJitPc(jb);
+  disp >>= 2;
+  if (kArmDispMin <= disp && disp <= kArmDispMax) {
+    instruction = kArmJmp | (disp & kArmDispMask);
+  } else {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    // As with calls, preserve the one-instruction contract and branch to a
+    // nearby absolute veneer instead of expanding the generated sequence.
+    if (!(addr = GetJitVeneer(addr))) return false;
+    disp = addr - GetJitPc(jb);
+    disp >>= 2;
+    unassert(kArmDispMin <= disp && disp <= kArmDispMax);
+    instruction = kArmJmp | (disp & kArmDispMask);
+#else
+    // B has a +/-128 MiB range. A debugserver-allocated iOS JIT pool can be
+    // farther from Blink's interpreter helpers, so use an absolute tail
+    // branch instead of wrapping the 26-bit displacement.
+    if (!AppendJitSetReg(jb, kArmIp0, addr)) return false;
+    instruction = kArmJumpReg | kArmIp0 << 5;
+#endif
+  }
+  return AppendJit(jb, &instruction, sizeof(instruction));
+#else
   u8 buf[5];
   int n = MakeJitJump(buf, GetJitPc(jb), (uintptr_t)code);
   return AppendJit(jb, buf, n);
+#endif
 }
 
 /**
@@ -1941,24 +2190,25 @@ bool AppendJitSetReg(struct JitBlock *jb, int reg, u64 value) {
   if (reg & 8) rex |= kAmdRexb;
   if (!value) {
     if (reg & 8) rex |= kAmdRexr;
-    if (rex) jb->addr[jb->index++] = rex;
-    jb->addr[jb->index++] = kAmdXor;
-    jb->addr[jb->index++] = 0300 | (reg & 7) << 3 | (reg & 7);
+    if (rex) GetJitWriteAddress(jb)[jb->index++] = rex;
+    GetJitWriteAddress(jb)[jb->index++] = kAmdXor;
+    GetJitWriteAddress(jb)[jb->index++] =
+        0300 | (reg & 7) << 3 | (reg & 7);
   } else if ((i64)value < 0 && (i64)value >= INT32_MIN) {
-    jb->addr[jb->index++] = rex | kAmdRexw;
-    jb->addr[jb->index++] = 0xC7;
-    jb->addr[jb->index++] = 0300 | (reg & 7);
-    Write32(jb->addr + jb->index, value);
+    GetJitWriteAddress(jb)[jb->index++] = rex | kAmdRexw;
+    GetJitWriteAddress(jb)[jb->index++] = 0xC7;
+    GetJitWriteAddress(jb)[jb->index++] = 0300 | (reg & 7);
+    Write32(GetJitWriteAddress(jb) + jb->index, value);
     jb->index += 4;
   } else {
     if (value > 0xffffffff) rex |= kAmdRexw;
-    if (rex) jb->addr[jb->index++] = rex;
-    jb->addr[jb->index++] = kAmdMovImm | (reg & 7);
+    if (rex) GetJitWriteAddress(jb)[jb->index++] = rex;
+    GetJitWriteAddress(jb)[jb->index++] = kAmdMovImm | (reg & 7);
     if ((rex & kAmdRexw) != kAmdRexw) {
-      Write32(jb->addr + jb->index, value);
+      Write32(GetJitWriteAddress(jb) + jb->index, value);
       jb->index += 4;
     } else {
-      Write64(jb->addr + jb->index, value);
+      Write64(GetJitWriteAddress(jb) + jb->index, value);
       jb->index += 8;
     }
   }
@@ -1984,7 +2234,7 @@ bool AppendJitSetReg(struct JitBlock *jb, int reg, u64 value) {
   int i, n = 0;
   unassert(!(reg & ~kArmRegMask));
   if (GetJitRemaining(jb) < 16) return OomJit(jb);
-  p = (u32 *)(jb->addr + jb->index);
+  p = (u32 *)(GetJitWriteAddress(jb) + jb->index);
   // TODO: This could be improved some more.
   if ((i64)value < 0 && (i64)value >= -0x8000) {
     p[n++] = kArmMovSex | ~value << kArmImmOff | reg << kArmRegOff;

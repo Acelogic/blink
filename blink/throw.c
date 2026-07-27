@@ -62,6 +62,18 @@ void DeliverSignalToUser(struct Machine *m, int sig, int code) {
 
 void HaltMachine(struct Machine *m, int code) {
   SIG_LOGF("HaltMachine(%d) at %#" PRIx64, code, m->ip);
+#ifdef BLINK_EMBEDDED
+  if (code == kMachineSegmentationFault || code == kMachineProtectionFault ||
+      code == 4 || code < 0) {
+    char diagnosis[256];
+    snprintf(diagnosis, sizeof(diagnosis),
+             "blink halt: trap=%d ip=%#" PRIx64 " oplen=%u"
+             " faultaddr=%#" PRIx64 " segvcode=%d reserving=%d\n",
+             code, m->ip, m->oplen, m->faultaddr, m->segvcode,
+             m->reserving);
+    WriteErrorString(diagnosis);
+  }
+#endif
   switch ((m->trapno = code)) {
     case kMachineDivideError:
       RestoreIp(m);

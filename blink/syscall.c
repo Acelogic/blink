@@ -136,6 +136,24 @@
 char *g_blink_path;
 bool FLAG_statistics;
 
+#if defined(BLINK_EMBEDDED) && defined(__APPLE__)
+__attribute__((weak)) int ish_pi_main(int argc, char **argv) {
+  errno = ENOSYS;
+  return -1;
+}
+
+static int SysIshPi(struct Machine *m, i64 argc, i64 argvaddr) {
+  char **argv;
+  int count;
+  if (argc < 1 || argc > 1024) return einval();
+  if (!(argv = CopyStrList(m, argvaddr))) return -1;
+  for (count = 0; count <= argc && argv[count]; ++count) {
+  }
+  if (count != argc || argv[count]) return einval();
+  return ish_pi_main(count, argv);
+}
+#endif
+
 // delegate to work around function pointer errors, b/c
 // old musl toolchains using `int ioctl(int, int, ...)`
 static int SystemIoctl(int fd, unsigned long request, ...) {
@@ -4974,11 +4992,20 @@ static int SysPause(struct Machine *m) {
 }
 
 static int SysSetsid(struct Machine *m) {
+#if defined(BLINK_EMBEDDED) && defined(__APPLE__)
+  return m->system->pid;
+#else
   return setsid();
+#endif
 }
 
 static i32 SysGetsid(struct Machine *m, i32 pid) {
+#if defined(BLINK_EMBEDDED) && defined(__APPLE__)
+  (void)pid;
+  return m->system->pid;
+#else
   return getsid(pid);
+#endif
 }
 
 static int SysGetpid(struct Machine *m) {
@@ -4994,19 +5021,35 @@ static int SysGetppid(struct Machine *m) {
 }
 
 static int SysGetuid(struct Machine *m) {
+#if defined(BLINK_EMBEDDED) && defined(__APPLE__)
+  return 0;
+#else
   return getuid();
+#endif
 }
 
 static int SysGetgid(struct Machine *m) {
+#if defined(BLINK_EMBEDDED) && defined(__APPLE__)
+  return 0;
+#else
   return getgid();
+#endif
 }
 
 static int SysGeteuid(struct Machine *m) {
+#if defined(BLINK_EMBEDDED) && defined(__APPLE__)
+  return 0;
+#else
   return geteuid();
+#endif
 }
 
 static int SysGetegid(struct Machine *m) {
+#if defined(BLINK_EMBEDDED) && defined(__APPLE__)
+  return 0;
+#else
   return getegid();
+#endif
 }
 
 static i32 SysGetgroups(struct Machine *m, i32 size, i64 addr) {
@@ -5191,19 +5234,36 @@ static int SysUmask(struct Machine *m, int mask) {
 }
 
 static int SysSetuid(struct Machine *m, int uid) {
+#if defined(BLINK_EMBEDDED) && defined(__APPLE__)
+  return uid ? eperm() : 0;
+#else
   return setuid(uid);
+#endif
 }
 
 static int SysSetgid(struct Machine *m, int gid) {
+#if defined(BLINK_EMBEDDED) && defined(__APPLE__)
+  return gid ? eperm() : 0;
+#else
   return setgid(gid);
+#endif
 }
 
 static int SysGetpgid(struct Machine *m, int pid) {
+#if defined(BLINK_EMBEDDED) && defined(__APPLE__)
+  (void)pid;
+  return m->system->pid;
+#else
   return getpgid(pid);
+#endif
 }
 
 static int SysGetpgrp(struct Machine *m) {
+#if defined(BLINK_EMBEDDED) && defined(__APPLE__)
+  return m->system->pid;
+#else
   return getpgid(0);
+#endif
 }
 
 static int SysAlarm(struct Machine *m, unsigned seconds) {
@@ -5211,7 +5271,13 @@ static int SysAlarm(struct Machine *m, unsigned seconds) {
 }
 
 static int SysSetpgid(struct Machine *m, int pid, int gid) {
+#if defined(BLINK_EMBEDDED) && defined(__APPLE__)
+  (void)pid;
+  (void)gid;
+  return 0;
+#else
   return setpgid(pid, gid);
+#endif
 }
 
 static int SysCreat(struct Machine *m, i64 path, int mode) {
@@ -5685,6 +5751,9 @@ void OpSyscall(P) {
     SYSCALL(5, 0x147, "preadv2", SysPreadv2, STRACE_PREADV2);
     SYSCALL(5, 0x148, "pwritev2", SysPwritev2, STRACE_PWRITEV2);
     SYSCALL(3, 0x1B4, "close_range", SysCloseRange, STRACE_3);
+#if defined(BLINK_EMBEDDED) && defined(__APPLE__)
+    SYSCALL(2, 0x1FF, "ish_pi", SysIshPi, STRACE_2);
+#endif
 #ifdef HAVE_EPOLL_PWAIT1
     SYSCALL(1, 0x0D5, "epoll_create", SysEpollCreate, STRACE_1);
     SYSCALL(1, 0x123, "epoll_create1", SysEpollCreate1, STRACE_1);

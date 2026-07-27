@@ -360,6 +360,12 @@ void exit(int status) {
 int BlinkMain(int argc, char *argv[]) {
   SetupWeb();
   GetStartDir();
+#ifdef BLINK_EMBEDDED
+  // Embedded callers own stderr. Keep Blink diagnostics in the configured log
+  // so guest programs can use fd 2 for prompts and normal terminal output.
+  FLAG_nologstderr = true;
+  FLAG_alsologtostderr = false;
+#endif
 #ifndef NDEBUG
   AtAbort(PrintStats);
 #endif

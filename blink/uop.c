@@ -1618,7 +1618,8 @@ static void CallFunction(struct Machine *m, void *fun) {
 }
 
 static void CallMicroOp(struct Machine *m, void *fun) {
-#ifdef TRIVIALLY_RELOCATABLE
+#if defined(TRIVIALLY_RELOCATABLE) && \
+    !(defined(BLINK_EMBEDDED) && defined(__APPLE__))
   long len;
   if ((len = GetMicroOpLength(fun)) > 0) {
     AppendJit(m->path.jb, fun, len);

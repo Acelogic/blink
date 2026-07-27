@@ -87,10 +87,17 @@ void LoadArgv(struct Machine *m, char *execfn, char *prog, char **args,
   p = bloc + nall;
   dx = PushString(m, prog);
   PUSH_AUXV(0, 0);
+#if defined(BLINK_EMBEDDED) && defined(__APPLE__)
+  PUSH_AUXV(AT_UID_LINUX, 0);
+  PUSH_AUXV(AT_EUID_LINUX, 0);
+  PUSH_AUXV(AT_GID_LINUX, 0);
+  PUSH_AUXV(AT_EGID_LINUX, 0);
+#else
   PUSH_AUXV(AT_UID_LINUX, getuid());
   PUSH_AUXV(AT_EUID_LINUX, geteuid());
   PUSH_AUXV(AT_GID_LINUX, getgid());
   PUSH_AUXV(AT_EGID_LINUX, getegid());
+#endif
   PUSH_AUXV(AT_SECURE_LINUX, IsProcessTainted());
   PUSH_AUXV(AT_PAGESZ_LINUX, GetGuestPageSize(m));
   PUSH_AUXV(AT_CLKTCK_LINUX, sysconf(_SC_CLK_TCK));

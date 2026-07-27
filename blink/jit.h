@@ -15,7 +15,11 @@
 #define kJitAlign        16
 #define kJitJumpTries    16
 #define kJitBlockSize    262144
+#if defined(BLINK_EMBEDDED) && defined(__APPLE__)
+#define kJitMemorySize   8388608
+#else
 #define kJitMemorySize   32505856
+#endif
 #define kJitRetireQueue  (int)(kJitMemorySize / kJitBlockSize * .10)
 #define kJitSlabInts     (65536 / sizeof(struct JitInts))
 #define kJitInitialHooks 16384
@@ -84,14 +88,17 @@
 #endif
 
 #ifdef __aarch64__
-#define kArmJmp    0x14000000u  // B
-#define kArmCall   0x94000000u  // BL
-#define kArmRet    0xd65f03c0u  // RET
-#define kArmMovNex 0xf2800000u  // sets sub-word of register to immediate
-#define kArmMovZex 0xd2800000u  // load immediate into reg w/ zero-extend
-#define kArmMovSex 0x92800000u  // load 1's complement imm w/ sign-extend
-#define kArmAdr    0x10000000u  // form PC-relative byte address
-#define kArmAdrp   0x90000000u  // form PC-relative page address
+#define kArmJmp     0x14000000u  // B
+#define kArmCall    0x94000000u  // BL
+#define kArmCallReg 0xd63f0000u  // BLR Xn
+#define kArmJumpReg 0xd61f0000u  // BR Xn
+#define kArmRet     0xd65f03c0u  // RET
+#define kArmMovNex  0xf2800000u  // sets sub-word of register to immediate
+#define kArmMovZex  0xd2800000u  // load immediate into reg w/ zero-extend
+#define kArmMovSex  0x92800000u  // load 1's complement imm w/ sign-extend
+#define kArmAdr     0x10000000u  // form PC-relative byte address
+#define kArmAdrp    0x90000000u  // form PC-relative page address
+#define kArmIp0     16           // AAPCS64 intra-procedure-call scratch reg
 #define kArmLdrPc \
   0x18000000u                        // load PC-relative memory into register
                                      // (general or SIMD)
@@ -182,6 +189,7 @@ struct JitPage {
 
 struct JitBlock {
   u8 *addr;
+  u8 *staging;
   i64 virt;
   long start;
   long index;

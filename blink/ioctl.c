@@ -48,12 +48,54 @@
 #include <sys/sockio.h>
 #endif
 
+#if defined(BLINK_EMBEDDED) && defined(__APPLE__)
+static int g_ish_embedded_terminal_initialized;
+static struct termios g_ish_embedded_termios;
+static struct winsize g_ish_embedded_winsize;
+
+static void InitIshEmbeddedTerminal(void) {
+  if (g_ish_embedded_terminal_initialized) return;
+  memset(&g_ish_embedded_termios, 0, sizeof(g_ish_embedded_termios));
+  g_ish_embedded_termios.c_iflag = BRKINT | ICRNL | IXON;
+  g_ish_embedded_termios.c_oflag = OPOST | ONLCR;
+  g_ish_embedded_termios.c_cflag = CREAD | CS8 | HUPCL;
+  g_ish_embedded_termios.c_lflag =
+      ECHO | ECHOE | ECHOK | ICANON | ISIG | IEXTEN;
+  g_ish_embedded_termios.c_cc[VINTR] = 3;
+  g_ish_embedded_termios.c_cc[VQUIT] = 28;
+  g_ish_embedded_termios.c_cc[VERASE] = 127;
+  g_ish_embedded_termios.c_cc[VKILL] = 21;
+  g_ish_embedded_termios.c_cc[VEOF] = 4;
+  g_ish_embedded_termios.c_cc[VSTART] = 17;
+  g_ish_embedded_termios.c_cc[VSTOP] = 19;
+  g_ish_embedded_termios.c_cc[VSUSP] = 26;
+  g_ish_embedded_termios.c_cc[VMIN] = 1;
+  g_ish_embedded_termios.c_cc[VTIME] = 0;
+  cfsetispeed(&g_ish_embedded_termios, B38400);
+  cfsetospeed(&g_ish_embedded_termios, B38400);
+  memset(&g_ish_embedded_winsize, 0, sizeof(g_ish_embedded_winsize));
+  g_ish_embedded_winsize.ws_row = 24;
+  g_ish_embedded_winsize.ws_col = 80;
+  g_ish_embedded_terminal_initialized = 1;
+}
+#endif
+
 static int IoctlTiocgwinsz(struct Machine *m, int fd, i64 addr,
                            int fn(int, struct winsize *)) {
   int rc;
   struct winsize ws;
   struct winsize_linux gws;
-  if ((rc = fn(fd, &ws)) != -1) {
+#if defined(BLINK_EMBEDDED) && defined(__APPLE__)
+  if ((rc = fn(fd, &ws)) == -1 && errno == ENOTTY &&
+      fd >= STDIN_FILENO && fd <= STDERR_FILENO) {
+    InitIshEmbeddedTerminal();
+    ws = g_ish_embedded_winsize;
+    rc = 0;
+  }
+#else
+  rc = fn(fd, &ws);
+#endif
+  if (rc != -1) {
     XlatWinsizeToLinux(&gws, &ws);
     if (CopyToUserWrite(m, addr, &gws, sizeof(gws)) == -1) rc = -1;
   }
@@ -66,7 +108,16 @@ static int IoctlTiocswinsz(struct Machine *m, int fd, i64 addr,
   struct winsize_linux gws;
   if (CopyFromUserRead(m, &gws, addr, sizeof(gws)) == -1) return -1;
   XlatWinsizeToHost(&ws, &gws);
-  return fn(fd, &ws);
+  int rc = fn(fd, &ws);
+#if defined(BLINK_EMBEDDED) && defined(__APPLE__)
+  if (rc == -1 && errno == ENOTTY &&
+      fd >= STDIN_FILENO && fd <= STDERR_FILENO) {
+    InitIshEmbeddedTerminal();
+    g_ish_embedded_winsize = ws;
+    rc = 0;
+  }
+#endif
+  return rc;
 }
 
 static int IoctlTcgets(struct Machine *m, int fd, i64 addr,
@@ -74,7 +125,17 @@ static int IoctlTcgets(struct Machine *m, int fd, i64 addr,
   int rc;
   struct termios tio;
   struct termios_linux gtio;
-  if ((rc = fn(fd, &tio)) != -1) {
+#if defined(BLINK_EMBEDDED) && defined(__APPLE__)
+  if ((rc = fn(fd, &tio)) == -1 && errno == ENOTTY &&
+      fd >= STDIN_FILENO && fd <= STDERR_FILENO) {
+    InitIshEmbeddedTerminal();
+    tio = g_ish_embedded_termios;
+    rc = 0;
+  }
+#else
+  rc = fn(fd, &tio);
+#endif
+  if (rc != -1) {
     XlatTermiosToLinux(&gtio, &tio);
     if (CopyToUserWrite(m, addr, &gtio, sizeof(gtio)) == -1) rc = -1;
   }
@@ -87,11 +148,22 @@ static int IoctlTcsets(struct Machine *m, int fd, int request, i64 addr,
   struct termios_linux gtio;
   if (CopyFromUserRead(m, &gtio, addr, sizeof(gtio)) == -1) return -1;
   XlatLinuxToTermios(&tio, &gtio);
-  return fn(fd, request, &tio);
+  int rc = fn(fd, request, &tio);
+#if defined(BLINK_EMBEDDED) && defined(__APPLE__)
+  if (rc == -1 && errno == ENOTTY &&
+      fd >= STDIN_FILENO && fd <= STDERR_FILENO) {
+    InitIshEmbeddedTerminal();
+    g_ish_embedded_termios = tio;
+    rc = 0;
+  }
+#endif
+  return rc;
 }
 
 static int IoctlTiocgpgrp(struct Machine *m, int fd, i64 addr) {
+#if !(defined(BLINK_EMBEDDED) && defined(__APPLE__))
   int rc;
+#endif
   u8 *pgrp;
 #ifdef __EMSCRIPTEN__
   // Force shells to disable job control in emscripten
@@ -99,15 +171,28 @@ static int IoctlTiocgpgrp(struct Machine *m, int fd, i64 addr) {
   return -1;
 #endif
   if (!(pgrp = (u8 *)SchlepW(m, addr, 4))) return -1;
+#if defined(BLINK_EMBEDDED) && defined(__APPLE__)
+  // An iOS app cannot make its PTY the controlling terminal of the host
+  // process. Keep terminal foreground state in the guest process namespace.
+  (void)fd;
+  Write32(pgrp, m->system->pid);
+  return 0;
+#else
   if ((rc = VfsTcgetpgrp(fd)) == -1) return -1;
   Write32(pgrp, rc);
   return 0;
+#endif
 }
 
 static int IoctlTiocspgrp(struct Machine *m, int fd, i64 addr) {
   u8 *pgrp;
   if (!(pgrp = (u8 *)SchlepR(m, addr, 4))) return -1;
+#if defined(BLINK_EMBEDDED) && defined(__APPLE__)
+  (void)Read32(pgrp);
+  return 0;
+#else
   return VfsTcsetpgrp(fd, Read32(pgrp));
+#endif
 }
 
 #ifdef HAVE_SIOCGIFCONF
@@ -229,14 +314,22 @@ static int IoctlTcxonc(struct Machine *m, int fildes, int arg) {
 }
 
 static int IoctlTiocgsid(struct Machine *m, int fildes, i64 addr) {
+#if !(defined(BLINK_EMBEDDED) && defined(__APPLE__))
   int rc;
+#endif
   u8 *sid;
   if (!(sid = (u8 *)SchlepW(m, addr, 4))) return -1;
+#if defined(BLINK_EMBEDDED) && defined(__APPLE__)
+  (void)fildes;
+  Write32(sid, m->system->pid);
+  return 0;
+#else
   if ((rc = VfsTcgetsid(fildes)) != -1) {
     Write32(sid, rc);
     rc = 0;
   }
   return rc;
+#endif
 }
 
 static int XlatFlushQueue(int queue) {

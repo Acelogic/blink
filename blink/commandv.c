@@ -66,7 +66,16 @@ static char AccessCommand(struct PathSearcher *ps, const char *suffix,
   if (pathlen && ps->path[pathlen - 1] != '/') ps->path[pathlen++] = '/';
   memcpy(ps->path + pathlen, ps->name, ps->namelen);
   memcpy(ps->path + pathlen + ps->namelen, suffix, suffixlen + 1);
+#ifdef BLINK_EMBEDDED
+  /*
+   * iOS app data containers are mounted no-exec. Blink only reads guest
+   * binaries and validates their guest execute bits in CheckExecutableFile(),
+   * so asking the host for X_OK incorrectly hides valid x86_64 programs.
+   */
+  return !VfsAccess(AT_FDCWD, ps->path, R_OK, 0);
+#else
   return !VfsAccess(AT_FDCWD, ps->path, X_OK, 0);
+#endif
 }
 
 static char SearchPath(struct PathSearcher *ps, const char *suffix) {

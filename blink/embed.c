@@ -1,5 +1,6 @@
 #include "blink/blink.h"
 
+#include <errno.h>
 #include <stdint.h>
 
 #include "blink/jit.h"
@@ -15,7 +16,7 @@ int BlinkJitSelfTest(void) {
 
   InitMap();
   if (InitJit(&jit, 0)) {
-    return -2;
+    return -1000 - errno;
   }
   if (!(block = StartJit(&jit, key))) {
     result = 77;
