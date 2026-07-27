@@ -21,8 +21,10 @@
 // iOS cannot fork or set the system clock.
 // #define HAVE_FORK
 #define HAVE_SYNC
-#define HAVE_DUP3
-#define HAVE_PIPE2
+// dup3() and pipe2() were added to iOS after our deployment target. Blink's
+// portable dup/pipe implementations preserve support for older devices.
+// #define HAVE_DUP3
+// #define HAVE_PIPE2
 // #define HAVE_WAIT4
 #define HAVE_SYSCTL
 // #define HAVE_INT128
@@ -39,7 +41,8 @@
 #define HAVE_REALPATH
 #define HAVE_SETREUID
 // #define HAVE_FDATASYNC
-#define HAVE_STRCHRNUL
+// strchrnul() is only available on newer iOS releases.
+// #define HAVE_STRCHRNUL
 #define HAVE_VASPRINTF
 // #define HAVE_SETRESUID
 // #define HAVE_KERN_ARND
