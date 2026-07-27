@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include "blink/assert.h"
+#include "blink/blink.h"
 #include "blink/builtin.h"
 #include "blink/bus.h"
 #include "blink/case.h"
@@ -356,7 +357,7 @@ void exit(int status) {
 }
 #endif
 
-int main(int argc, char *argv[]) {
+int BlinkMain(int argc, char *argv[]) {
   SetupWeb();
   GetStartDir();
 #ifndef NDEBUG
@@ -402,3 +403,9 @@ int main(int argc, char *argv[]) {
   argv[optind_] = g_pathbuf;
   return Exec(g_pathbuf, g_pathbuf, argv + optind_ + FLAG_zero, environ);
 }
+
+#ifndef BLINK_EMBEDDED
+int main(int argc, char *argv[]) {
+  return BlinkMain(argc, argv);
+}
+#endif

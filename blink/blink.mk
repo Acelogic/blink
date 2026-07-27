@@ -67,6 +67,8 @@ o/tiny/x86_64-gcc49/blink/syscall.o: private CFLAGS += -fpie
 o/tiny/aarch64/blink/syscall.o: private CFLAGS += -fpie
 
 o/$(MODE)/blink/blink.a: $(filter-out %/blink.o,$(filter-out %/blinkenlights.o,$(BLINK_OBJS)))
+o/$(MODE)/blink/blink-embedded.a: CPPFLAGS += -DBLINK_EMBEDDED
+o/$(MODE)/blink/blink-embedded.a: $(filter-out %/oneoff.o,$(filter-out %/blinkenlights.o,$(BLINK_OBJS)))
 o/$(MODE)/i486/blink/blink.a: $(filter-out %/blink.o,$(filter-out %/blinkenlights.o,$(BLINK_SRCS:%.c=o/$(MODE)/i486/%.o)))
 o/$(MODE)/m68k/blink/blink.a: $(filter-out %/blink.o,$(filter-out %/blinkenlights.o,$(BLINK_SRCS:%.c=o/$(MODE)/m68k/%.o)))
 o/$(MODE)/x86_64/blink/blink.a: $(filter-out %/blink.o,$(filter-out %/blinkenlights.o,$(BLINK_SRCS:%.c=o/$(MODE)/x86_64/%.o)))

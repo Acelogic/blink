@@ -25,6 +25,10 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 #include "blink/assert.h"
 #include "blink/atomic.h"
 #include "blink/bitscan.h"
@@ -170,7 +174,13 @@ static inline unsigned ShallNotPass(unsigned gen1, _Atomic(unsigned) *genptr) {
 // we use a non-posix api in order to have jit. the problem is the api
 // frequently flakes with "Trace/BPT trap: 5" errors. this fixes that.
 static void pthread_jit_write_protect_np_workaround(int enabled) {
-#if defined(__APPLE__) && defined(__aarch64__)
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+  // iOS exposes pthread_jit_write_protect_supported_np(), but explicitly
+  // marks pthread_jit_write_protect_np() unavailable. A debugger-enabled iOS
+  // process receives an RWX MAP_JIT mapping, so there is no per-thread
+  // write-protection state to toggle.
+  (void)enabled;
+#elif defined(__APPLE__) && defined(__aarch64__)
   int count_start = 8192;
   volatile int count = count_start;
   uint64_t *addr, val, val2, reread = -1;
